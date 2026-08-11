@@ -37,31 +37,32 @@ __global__ void reduction_v0(float *out, const float *inp)
     sdata[tid] = inp[gid];
     __syncthreads();
 
-    // // 1. 乘法归约
-    // for(unsigned int s = 1; s < blockDim.x; s <<= 1)
+    // 1. 乘法归约 : 缺点是仅偶数编号的线程进行计算，奇数编号的线程空闲，导致线程束分化！！！
+    for(unsigned int s = 1; s < blockDim.x; s <<= 1)
+    {
+        // tid是2*s的整数倍
+        // s = 1:
+        //   tid = 0, 2, 4, ..., 1022
+        //   [0, 1], [2, 3], [4, 5], ..., [1022, 1023]
+        // s = 2:
+        //   tid = 0, 4, 8, ...,  
+        //   [0, 4], [8, 12], [16, 20], ..., [1016, 1023]
+        if(tid % (2 * s) == 0 && tid + s < blockDim.x)
+        {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // // 1. 除法归约: 放至reduce_v2
+    // for(unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
     // {
-    //     // tid是2*s的整数倍
-    //     // s = 1:
-    //     //   tid = 0, 2, 4, ..., 1022
-    //     //   [0, 1], [2, 3], [4, 5], ..., [1022, 1023]
-    //     // s = 2:
-    //     //   tid = 0, 4, 8, ...,  
-    //     //   [0, 4], [8, 12], [16, 20], ..., [1016, 1023]
-    //     if(tid % (2 * s) == 0 && tid + s < blockDim.x)
+    //     if (tid < s)
     //     {
     //         sdata[tid] += sdata[tid + s];
     //     }
     //     __syncthreads();
     // }
-    // 1. 除法归约
-    for(unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1)
-    {
-        if (tid < offset)
-        {
-            sdata[tid] += sdata[tid + offset];
-        }
-        __syncthreads();
-    }
 
     // 2. 由每个线程块的第一个线程将sdata[0]写到结果
     if(tid == 0) out[blockIdx.x] = sdata[0];
@@ -118,8 +119,9 @@ int main()
         constexpr int Warmup = 20;
         constexpr int Iters = 200;
 
-        const int ThreadsPerBlock0 = N / 1024;
-        const int BlocksPerGrid0 = N / 1024;
+        const int ThreadsPerBlock0 = N / 1024; // 1024
+        const int BlocksPerGrid0 = N / 1024;   // 1024
+
         auto benchmark_v0 = [&]() {
             for (int i = 0; i < Warmup; ++i) {
                 // 1. 线程块间归约至sdata[0], 放到device_block_out[0~1023]

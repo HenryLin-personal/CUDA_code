@@ -10,7 +10,7 @@ const int N = 1024 * 1024;  // 1M elements
 
 #define FULL_MASK 0xffffffff
 __device__ void warpReduce(float *cache, unsigned int tid) {
-  int v = cache[tid] + cache[tid + 32];
+  float v = cache[tid] + cache[tid + 32];
   v += __shfl_down_sync(FULL_MASK, v, 16);
   v += __shfl_down_sync(FULL_MASK, v, 8);
   v += __shfl_down_sync(FULL_MASK, v, 4);
