@@ -56,7 +56,7 @@ float reduce_cpu(const std::vector<float>& data) {
 const int BLOCK_SIZE = 1024;
 const int N = 1024 * 1024;  // 1M elements
 int main() {
-  int num_blocks = ((N + BLOCK_SIZE - 1) / BLOCK_SIZE);
+  int num_blocks = ((N + BLOCK_SIZE - 1) / BLOCK_SIZE); // 1024
 
   std::vector<float> h_data(N);
 
