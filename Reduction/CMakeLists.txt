@@ -1,8 +1,6 @@
 # 最低版本要求
 cmake_minimum_required(VERSION 3.20)
 # 项目信息
-set(CMAKE_BUILD_TYPE Debug)
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
 project(global_memory LANGUAGES CXX CUDA)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_STANDARD 14) # 用于指定CUDA编译器应使用的CUDA C++标准的版本
@@ -15,8 +13,6 @@ add_executable(reductionv1 reduction_v1.cu)
 # add_executable(reductionv2 reduction_v2.cu)
 # add_executable(reductionv3 reduction_v3.cu)
 # add_executable(reductionv4 reduction_v4.cu)
-target_link_libraries(reductionv0 PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(reductionv1 PRIVATE ${CMAKE_SOURCE_DIR})
 
 target_link_libraries(reductionv0 PRIVATE ${CUDA_LIBRARIES})
 target_link_libraries(reductionv1 PRIVATE ${CUDA_LIBRARIES})
