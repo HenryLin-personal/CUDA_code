@@ -19,6 +19,9 @@ add_executable(matmulv1 matmul1.cu)
 target_link_libraries(matmulv1 PRIVATE CUDA::cublas)
 add_executable(matmulv2 matmul2.cu)
 target_link_libraries(matmulv2 PRIVATE CUDA::cublas)
+add_executable(matmul_cpu matmul_cpu.cc)
+add_executable(matmulv3 matmul3.cu)
+target_link_libraries(matmulv3 PRIVATE CUDA::cublas)
 
 message(STATUS "CMAKE_BUILD_TYPE = ${CMAKE_BUILD_TYPE}")
 

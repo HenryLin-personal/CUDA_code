@@ -15,6 +15,8 @@
 #include "comm.cuh"
 
 namespace {
+#define LOAD_FLOAT4(ptr) (reinterpret_cast<const float4 *>(&(ptr))[0])
+#define STORE_FLOAT4(ptr) (reinterpret_cast<float4 *>(&(ptr))[0])
 
 // Row-major matrix layout:
 // A: M x K, B: K x N, C: M x N.
@@ -109,7 +111,7 @@ private:
 };
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void matmul_v2(
+__global__ void matmul_v3(
     int m,
     int n,
     int k,
@@ -119,130 +121,86 @@ __global__ void matmul_v2(
     float beta,
     float *c)
 {
-    // const int bx = blockIdx.x;
-    // const int by = blockIdx.y;
-    // const int tx = threadIdx.x * TN;
-    // const int ty = threadIdx.y * TM;
-
-    // __shared__ float As[BM * BK];
-    // __shared__ float Bs[BK * BN];
-
-    // __shared__ float As_2d[BM][BK];
-    // __shared__ float Bs_2d[BK][BN];
-
-    // a = &a[by * BM * k];
-    // b = &b[bx * BN];
-    // c = &c[by * BM * n + bx * BN];
-
-    // const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    // const int thread_num = blockDim.x * blockDim.y;
-
-    // // 协作加载A tile
-    // int a_tile_row = tid / BK;  // 思考：若改为threadIdx.x/theadIdx.y, a_tile_row对每个[TM, TN]的微块起始地址一样吗？
-    // int a_tile_col = tid % BK;
-    // int a_tile_stride = thread_num / BK;
-
-    // // 协作加载B tile
-    // int b_tile_row = tid / BN;
-    // int b_tile_col = tid % BN;
-    // int b_tile_stride = thread_num / BN;
-
-    // float accum[TM][TN] = {0.};
-    // for(int k_i = 0; k_i < k; k_i += BK)
-    // {
-    //     // 1. 线程复制数据到共享内存
-    //     for (int i = 0; i < BM; i += a_tile_stride) {
-    //         // As[(a_tile_row + i) * BK + a_tile_col] =
-    //         //     a[(a_tile_row + i) * k + a_tile_col];
-    //         As_2d[a_tile_row + i][a_tile_col] = a[(a_tile_row + i) * k + a_tile_col];
-    //     }
-    //     for (int i = 0; i < BK; i += b_tile_stride) {
-    //         // Bs[(b_tile_row + i) * BN + b_tile_col] =
-    //         //     b[(b_tile_row + i) * n + b_tile_col];
-    //         Bs_2d[b_tile_row + i][b_tile_col] = b[(b_tile_row + i) * n + b_tile_col];
-    //     }
-       
-    //     __syncthreads();
-
-    //     // 2. 复用matmul0中的矩阵乘法逻辑
-    //     for (int i = 0; i < BK; i++) {
-    //         for (int j = 0; j < TM; j++) {
-    //             for (int l = 0; l < TN; l++) {
-    //                 // accum[j][l] += As[(ty + j) * BK + i] * Bs[tx + i * BN + l];
-    //                 accum[j][l] += As_2d[ty + j][i] * Bs_2d[i][tx + l];
-    //             }
-    //         }
-    //     }
-    //     __syncthreads();
-
-    //     // 3. 更新A和B
-    //     a += BK; b += n * BK;
-    // }
-    // // 4. 将结果传回c矩阵
-    // for (int j = 0; j < TM; j++) {
-    //     for (int l = 0; l < TN; l++) {
-    //         c[(ty + j) * N + tx + l] =  
-    //             alpha * accum[j][l] + beta * c[(ty + j) * N + tx + l];
-    //     }
-    // }
-
-    // 已有BM, BN, BK, TM, TN
-    // 4096^2个数据项，
     const int bx = blockIdx.x;
     const int by = blockIdx.y;
-    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    const int thread_num = blockDim.x * blockDim.y;
+    const int tx = threadIdx.x * TN;
+    const int ty = threadIdx.y * TM;
+
+    __shared__ float As_2D_T[BK][BM];
+    __shared__ float Bs_2D[BK][BN];
+
 
     a = &a[by * BM * k];
     b = &b[bx * BN];
     c = &c[by * BM * n + bx * BN];
 
-    __shared__ float As_2d[BM][BK];
-    __shared__ float Bs_2d[BK][BN];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int thread_num = (BM / TM) * (BN / TN);
+    const int V = 4; // 每个线程加载4个数据
 
-    const int tx = threadIdx.x * TN;
-    const int ty = threadIdx.y * TM;
-    const int a_tile_row = tid / BK;
-    const int a_tile_col = tid % BK;
-    const int a_tile_stride = thread_num / BK;
+    // 协作加载A tile
+    const int ldg_a_num = BM * BK / thread_num / V; // 表示每个线程需要加载多少组float4: 128 * 128 / 256 / 4 = 16组，共64个float
+    int a_tile_row = tid / (BK / V);
+    int a_tile_col = (tid % (BK / V)) * V;
+    int a_tile_stride = BM / ldg_a_num; // 128 / 16 = 8
 
-    const int b_tile_row = tid / BN;
-    const int b_tile_col = tid % BN;
-    const int b_tile_stride = thread_num / BN;
-    float accum[TM][TN] = {0.f};
-    for(int k_i = 0; k_i < k; k_i += BK, a += BK, b += n * BK)
+    // 协作加载B tile
+    const int ldg_b_num = BK * BN / thread_num / V; // 128 * 128 / 256 / 4 = 16组，共64个float
+    int b_tile_row = tid / (BN / V);
+    int b_tile_col = (tid % (BN / V)) * V;
+    int b_tile_stride = BK / ldg_b_num; // 128 / 16 = 8
+
+    float4 a_reg[ldg_a_num];
+    float a_flag[TM];
+    float b_flag[TN];
+    float accum[TM][TN]{0.f};
+
+    for(int k_i = 0; k_i < k; k_i += BK)
     {
-        // 1. 搬运数据至共享显存
-        for(int i = 0; i < BM; i += a_tile_stride) {
-            As_2d[a_tile_row + i][a_tile_col] = a[(a_tile_row + i) * k + a_tile_col];
+        // 1. 线程复制数据到共享内存
+        for (int i = 0; i < BM; i += a_tile_stride) {
+            int ldg_index = i / a_tile_stride; // BM = 128, a_tile_stride = 8, ldg_index = 0, 1, 2, ..., 15
+            a_reg[ldg_index] = LOAD_FLOAT4(a[(a_tile_row + i) * k + a_tile_col]);
+            As_2D_T[a_tile_col][i + a_tile_row] = a_reg[ldg_index].x;
+            As_2D_T[a_tile_col + 1][i + a_tile_row] = a_reg[ldg_index].y;
+            As_2D_T[a_tile_col + 2][i + a_tile_row] = a_reg[ldg_index].z;
+            As_2D_T[a_tile_col + 3][i + a_tile_row] = a_reg[ldg_index].w;
         }
-        for(int i = 0; i < BK; i += b_tile_stride) {
-            Bs_2d[b_tile_row + i][b_tile_col] = b[(b_tile_row + i) * n + b_tile_col];
+        for (int i = 0; i < BK; i += b_tile_stride) {
+            STORE_FLOAT4(Bs_2D[b_tile_row + i][b_tile_col]) = LOAD_FLOAT4(b[(b_tile_row + i) * n + b_tile_col]);
         }
+       
         __syncthreads();
 
-        // 2. 共享显存求乘法
-        for(int i = 0; i < BK; i++)
-        {
-            for(int j = 0; j < TM; j++)
-            {
-                for(int l = 0; l < TN; l++)
-                {
-                    accum[j][l] += As_2d[ty + j][i] * Bs_2d[i][tx + l];
+        // 2. 复用matmul0中的矩阵乘法逻辑
+        for(int i = 0; i < BK; ++i) {
+            for(int j = 0; j < TM; j += V) {
+                STORE_FLOAT4(a_flag[j]) = LOAD_FLOAT4(As_2D_T[i][ty + j]);
+            }
+            for(int l = 0; l < TN; l += V) {
+                STORE_FLOAT4(b_flag[l]) = LOAD_FLOAT4(Bs_2D[i][tx + l]);
+            }
+
+            for(int j = 0; j < TM; ++j) {
+                for(int l = 0; l < TN; ++l) {
+                    accum[j][l] += a_flag[j] * b_flag[l];
                 }
             }
         }
         __syncthreads();
 
-        // 3. 更新至下一个循环
+        // 3. 更新A和B
+        a += BK; b += n * BK;
     }
-    // 4. accum写回C矩阵
-    for(int j = 0; j < TM; ++j)
-    {
-        for(int l = 0; l < TN; ++l)
-        {
-            float &cur = c[(ty + j) * n + tx + l];
-            cur = alpha * accum[j][l] + beta * cur;
+    // 4. 将结果传回c矩阵
+    for (int j = 0; j < TM; j++) {
+        for (int l = 0; l < TN; l += 4) {
+            float4 cur = LOAD_FLOAT4(c[(ty + j) * n + tx + l]);
+            cur.x = alpha * accum[j][l] + beta * cur.x;
+            cur.y = alpha * accum[j][l + 1] + beta * cur.y;
+            cur.z = alpha * accum[j][l + 2] + beta * cur.z;
+            cur.w = alpha * accum[j][l + 3] + beta * cur.w;
+            STORE_FLOAT4(c[(ty + j) * n + tx + l]) = cur;
         }
     }
 }
@@ -399,7 +357,7 @@ int main()
         std::vector<float> host_a(a_count);
         std::vector<float> host_b(b_count);
         std::vector<float> host_cublas(c_count, 0.0f);
-        std::vector<float> host_v2(c_count, 0.0f);
+        std::vector<float> host_v3(c_count, 0.0f);
 
         // Small random integers are exactly representable as float and expose
         // row/column indexing mistakes that all-one inputs can hide.
@@ -415,7 +373,7 @@ int main()
         auto device_a = make_device_buffer<float>(a_count);
         auto device_b = make_device_buffer<float>(b_count);
         auto device_cublas = make_device_buffer<float>(c_count);
-        auto device_v2 = make_device_buffer<float>(c_count);
+        auto device_v3 = make_device_buffer<float>(c_count);
 
         check_cuda(
             cudaMemcpy(device_a.get(), host_a.data(), a_bytes, cudaMemcpyHostToDevice),
@@ -426,10 +384,10 @@ int main()
             "copy B to device"
         );
         check_cuda(cudaMemset(device_cublas.get(), 0, c_bytes), "clear cuBLAS C");
-        check_cuda(cudaMemset(device_v2.get(), 0, c_bytes), "clear v2 C");
+        check_cuda(cudaMemset(device_v3.get(), 0, c_bytes), "clear v3 C");
 
         CublasHandle cublas;
-        const dim3 block(16, 16);
+        const dim3 block(BlockX, BlockY);
         const dim3 grid(ceil_div(N, 128), ceil_div(M, 128));
 
         const float cublas_ms = benchmark_gpu([&] {
@@ -446,8 +404,8 @@ int main()
             );
         });
 
-        const float v2_ms = benchmark_gpu([&] {
-            matmul_v2<128, 128, 8, 8, 8><<<grid, block>>>(
+        const float v3_ms = benchmark_gpu([&] {
+            matmul_v3<128, 128, 8, 8, 8><<<grid, block>>>(
                 M,
                 N,
                 K,
@@ -455,7 +413,7 @@ int main()
                 device_a.get(),
                 device_b.get(),
                 Beta,
-                device_v2.get()
+                device_v3.get()
             );
         });
 
@@ -470,19 +428,19 @@ int main()
         );
         check_cuda(
             cudaMemcpy(
-                host_v2.data(),
-                device_v2.get(),
+                host_v3.data(),
+                device_v3.get(),
                 c_bytes,
                 cudaMemcpyDeviceToHost
             ),
-            "copy v2 result to host"
+            "copy v3 result to host"
         );
 
         const VerificationResult verification =
-            verify_result(host_cublas, host_v2, N);
+            verify_result(host_cublas, host_v3, N);
         const double cublas_gflops = calculate_gflops(M, N, K, cublas_ms);
-        const double v2_gflops = calculate_gflops(M, N, K, v2_ms);
-        const double cublas_ratio = 100.0 * v2_gflops / cublas_gflops;
+        const double v3_gflops = calculate_gflops(M, N, K, v3_ms);
+        const double cublas_ratio = 100.0 * v3_gflops / cublas_gflops;
 
         std::cout << "Matrix: A[" << M << " x " << K << "] * B["
                   << K << " x " << N << "] -> C[" << M << " x " << N
@@ -494,7 +452,7 @@ int main()
         std::cout << "|---|---:|---:|---:|---|\n";
         std::cout << "| cuBLAS | " << cublas_ms << " | " << cublas_gflops
                   << " | 100.00% | reference |\n";
-        std::cout << "| matmul_v2 | " << v2_ms << " | " << v2_gflops
+        std::cout << "| matmul_v3 | " << v3_ms << " | " << v3_gflops
                   << " | " << cublas_ratio << "% | "
                   << (verification.matched ? "YES" : "NO") << " |\n";
         std::cout << "max absolute error: " << verification.max_absolute_error
