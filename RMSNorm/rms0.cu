@@ -21,7 +21,7 @@ __device__ void reductionv2(float *cache, const int tid)
     for(int offset = block_size / 2; offset > 0; offset >>= 1)
     {
         if(tid < offset) cache[tid] += cache[tid + offset];
-        __syncthreads();
+        __syncthreads(); // 512 256 128 64 32 16 8 4 2 1 共10次同步
     }
 }
 
@@ -45,12 +45,13 @@ __global__ void rmsnormv0(float* in, float* weight, float* out, int batch, int s
         acc += in_ptr[i] * in_ptr[i];
     }
     sum[tid] = acc;
-    __syncthreads();
+    __syncthreads(); // 1次同步
 
     // 2. sum规约 
     reductionv2(sum, tid);
 
-    float rms = 1.0f / sqrt(sum[0] / size + eps);
+    // float rms = 1.0f / sqrt(sum[0] / size + eps);
+    float rms = rsqrtf(sum[0] / size + eps);
     // 3. 计算x_i * gamma_i
     for(int i = tid; i < size; i += blockDim.x)
     {

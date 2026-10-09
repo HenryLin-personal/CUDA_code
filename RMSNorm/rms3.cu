@@ -17,58 +17,73 @@ namespace
 }
 
 #define FULL_MASK 0xffffffff
-__device__ void warpReduce(float *cache, unsigned int tid) {
-  float v = cache[tid] + cache[tid + 32];
+__device__ float warpReduce(float v) {
   v += __shfl_down_sync(FULL_MASK, v, 16);
   v += __shfl_down_sync(FULL_MASK, v, 8);
   v += __shfl_down_sync(FULL_MASK, v, 4);
   v += __shfl_down_sync(FULL_MASK, v, 2);
   v += __shfl_down_sync(FULL_MASK, v, 1);
-  cache[tid] = v;
+  return v;
 }
 
-__device__ void reductionv3(float *cache, const int tid)
+__device__ float reductionv4(float acc, const int tid)
 {
-    for(int offset = block_size / 2; offset > 32; offset >>= 1)
-    {
-        if(tid < offset) cache[tid] += cache[tid + offset];
-        __syncthreads(); // 512 256 128 64 4次同步
+    const int warp_size = 32;
+    const int lane_id = tid % warp_size;
+    const int warp_id = tid / warp_size;
+    const int warp_count = (block_size + warp_size - 1) / warp_size;
+
+    // 1. 每个warp内执行一次warpReduce, 保存在共享内存中
+    __shared__ float warpSum[warp_count];
+    acc = warpReduce(acc);
+    if(lane_id == 0) warpSum[warp_id] = acc; // 让每个线程束的第0个线程去写当前线程束内的规约结果.
+    __syncthreads();
+
+    // 2. warp0对共享内存进行规约
+    if(warp_id == 0) {
+        acc = lane_id < warp_count ? warpSum[lane_id] : 0.f; // lane_id∈[0,31], warp_count的最大值可能小于31, 比如block_size<1024时, warp_count<31. 但这里block_size=1024
+        acc = warpReduce(acc);
     }
-    if(tid < 32) warpReduce(cache, tid);
+    return acc;
 }
 
-__global__ void rmsnormv1(float* in, float* weight, float* out, int batch, int size, float eps)
+static_assert(size % 4 == 0, "float4向量化要求size是4的倍数");
+
+__global__ void rmsnormv3(float* in, float* weight, float* out, int batch, int size, float eps)
 {
-    // 每个block负责一个batch, block内有1024个线程, 每个线程负责
+    // 每个block负责一个batch, block内有1024个线程, 每个线程用一次float4读4个连续数据
     // threadIdx.x = 0:
-    //   in[0] * weight[0]       in[1024] * weight[1024] in[2048] * weight[2048] in[3072] * weight[3072] 
+    //   in[0..3] * weight[0..3]
     // ...
     // threadIdx.x = 1023:
-    //   in[1023] * weight[1023] in[2047] * weight[2047] in[3071] * weight[3071] in[4095] * weight[4095]
-    float *in_ptr = in + blockIdx.x * size;
-    float *out_ptr = out + blockIdx.x * size;
+    //   in[4092..4095] * weight[4092..4095]
+    // size % 4 == 0 且 cudaMalloc 256B对齐, 所以每行起始地址都满足float4的16B对齐要求
+    const float4 *in_ptr = reinterpret_cast<const float4*>(in + blockIdx.x * size);
+    const float4 *w_ptr = reinterpret_cast<const float4*>(weight);
+    float4 *out_ptr = reinterpret_cast<float4*>(out + blockIdx.x * size);
     const int tid = threadIdx.x;
+    const int vec_size = size / 4;
 
-    // 1. 每个线程写入共享内存
-    __shared__ float sum[block_size];
+    // 1. 每个线程维护一个寄存器变量
     float acc = 0.f;
-    for(int i = tid; i < size; i += blockDim.x)
+    for(int i = tid; i < vec_size; i += blockDim.x)
     {
-        acc += in_ptr[i] * in_ptr[i];
+        float4 v = in_ptr[i];
+        acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
-    sum[tid] = acc;
-    __syncthreads(); // 第1次写入
 
-    // 2. sum规约 
-    reductionv3(sum, tid);
-    __syncthreads(); // 最终结果由warp0写入, 需要调用同步原语 第6次同步
-    
-    // float rms = 1.0f / sqrt(sum[0] / size + eps);
-    float rms = rsqrtf(sum[0] / size + eps);
+    // 2. sum规约
+    float sum = reductionv4(acc, tid); // 此时只有warp0拿到了正确结果
+    __shared__ float s_rms;
+    if(tid == 0) s_rms = rsqrtf(sum / size + eps);
+    __syncthreads();
+    float rms = s_rms;
     // 3. 计算x_i * gamma_i
-    for(int i = tid; i < size; i += blockDim.x)
+    for(int i = tid; i < vec_size; i += blockDim.x)
     {
-        out_ptr[i] = in_ptr[i] * weight[i] * rms;
+        float4 v = in_ptr[i];
+        float4 w = w_ptr[i];
+        out_ptr[i] = make_float4(v.x * w.x * rms, v.y * w.y * rms, v.z * w.z * rms, v.w * w.w * rms);
     }
 }
 
@@ -76,7 +91,7 @@ void call_rmsnorm(float* in, float* weight, float* out, int batch, int size, flo
 {
     dim3 grid(grid_size);
     dim3 block(block_size);
-    rmsnormv1<<<grid, block>>>(in, weight, out, batch, size, eps);
+    rmsnormv3<<<grid, block>>>(in, weight, out, batch, size, eps);
 }
 
 int main()
@@ -109,7 +124,7 @@ int main()
 
     float avg_ms = 0.f;
     comm::check_cuda(cudaEventElapsedTime(&avg_ms, start.get(), end.get()), "cudaEventElapsedTime");
-    printf("rmsnorm1 avg_ms :%.2fus\n", avg_ms * 1000 / loops);
+    printf("rmsnorm3 avg_ms :%.2fus\n", avg_ms * 1000 / loops);
 
     
     comm::check_cuda(cudaMemcpy(out.data(), d_out.get(), count * sizeof(float), cudaMemcpyDeviceToHost), "d_out to out fail!");

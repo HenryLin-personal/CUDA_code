@@ -140,5 +140,14 @@ void verify_results(
     else
         std::cerr << "total mismatches: " << mismatches << '\n';
 }
+__device__ __inline__ float4 operator*(float4 a, float4 b)
+{
+    return make_float4(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w);
+}
+__device__ __inline__ float dot(float4 a, float4 b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
 } // namespace comm
 #endif

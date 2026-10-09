@@ -12,8 +12,10 @@ namespace
     constexpr float eps = 1.0f;
     constexpr int loops = 10;
 
-    constexpr int block_size = 1024;
+    constexpr int block_size = 256;
     constexpr int grid_size = batch;
+
+    using comm::operator*;
 }
 
 #define FULL_MASK 0xffffffff
@@ -47,37 +49,47 @@ __device__ float reductionv4(float acc, const int tid)
     return acc;
 }
 
-__global__ void rmsnormv2(float* in, float* weight, float* out, int batch, int size, float eps)
+static_assert(size % 4 == 0, "float4向量化要求size是4的倍数");
+__global__ void rmsnormv4(float* in, float* weight, float* out, int batch, int size, float eps)
 {
-    // 每个block负责一个batch, block内有1024个线程, 每个线程负责四个数据
-    // threadIdx.x = 0:
-    //   in[0] * weight[0]       in[1024] * weight[1024] in[2048] * weight[2048] in[3072] * weight[3072] 
-    // ...
-    // threadIdx.x = 1023:
-    //   in[1023] * weight[1023] in[2047] * weight[2047] in[3071] * weight[3071] in[4095] * weight[4095]
-    float *in_ptr = in + blockIdx.x * size;
-    float *out_ptr = out + blockIdx.x * size;
+    const float4 *in_ptr = reinterpret_cast<const float4*>(in + blockIdx.x * size);
+    const float4 *w_ptr = reinterpret_cast<const float4*>(weight);
+    float4 *out_ptr = reinterpret_cast<float4*>(out + blockIdx.x * size);
     const int tid = threadIdx.x;
 
-    // 1. 每个线程维护一个寄存器变量
+    // 1. 
+    // 每个block负责一个batch, block内有256个线程, 每个线程用N=4次float4读4个连续数据
+    // v[N]: v[i]表示线程i存储的第i个float4, i∈[0, 3]
+    // threadIdx.x = 0:
+    //   v[0] = in[0] * weight[0], v[1] = in[256] * weight[256], v[2] = in[512] * weight[512], v[3] = in[768] * weight[768]
+    // ...
+    // threadIdx.x = 255:
+    //   v[0] = in[255] * weight[255], v[1] = in[511] * weight[511], v[2] = in[767] * weight[767], v[3] = in[] * weight[768]
+
+    constexpr int N = ::size / block_size / 4; // 每个线程处理多少个float4, N=4
+    float4 v[N]; // 取in_ptr中的数据
     float acc = 0.f;
-    for(int i = tid; i < size; i += blockDim.x)
+    #pragma unroll
+    for(int i = 0; i < N; ++i)
     {
-        acc += in_ptr[i] * in_ptr[i];
+        v[i] = in_ptr[tid + i * block_size];
+        acc += comm::dot(v[i], v[i]);
     }
-    // __syncthreads(); // 无需这次同步
 
     // 2. sum规约
-    float sum = reductionv4(acc, tid); // 此时只有warp0拿到了正确结果, 同步1次
+    float sum = reductionv4(acc, tid); // 此时只有warp0拿到了正确结果
     __shared__ float s_rms;
-    // if(tid == 0) s_rms = 1.0f / sqrt(sum / size + eps);
     if(tid == 0) s_rms = rsqrtf(sum / size + eps);
-    __syncthreads(); // 第2次同步
-    float rms = s_rms;
+    __syncthreads();
+    float rms = s_rms; // 广播, 不存在bank conflict!!!
+
     // 3. 计算x_i * gamma_i
-    for(int i = tid; i < size; i += blockDim.x)
+    #pragma unroll
+    for(int i = 0; i < N; ++i)
     {
-        out_ptr[i] = in_ptr[i] * weight[i] * rms;
+        float4 V = v[i];
+        float4 W = w_ptr[tid + i * block_size];
+        out_ptr[tid + i * block_size] = make_float4(V.x * W.x * rms, V.y * W.y *rms, V.z * W.z * rms, V.w * W.w * rms);
     }
 }
 
@@ -85,7 +97,7 @@ void call_rmsnorm(float* in, float* weight, float* out, int batch, int size, flo
 {
     dim3 grid(grid_size);
     dim3 block(block_size);
-    rmsnormv2<<<grid, block>>>(in, weight, out, batch, size, eps);
+    rmsnormv4<<<grid, block>>>(in, weight, out, batch, size, eps);
 }
 
 int main()
@@ -118,7 +130,7 @@ int main()
 
     float avg_ms = 0.f;
     comm::check_cuda(cudaEventElapsedTime(&avg_ms, start.get(), end.get()), "cudaEventElapsedTime");
-    printf("rmsnorm0 avg_ms :%.2fus\n", avg_ms * 1000 / loops);
+    printf("rmsnorm3 avg_ms :%.2fus\n", avg_ms * 1000 / loops);
 
     
     comm::check_cuda(cudaMemcpy(out.data(), d_out.get(), count * sizeof(float), cudaMemcpyDeviceToHost), "d_out to out fail!");

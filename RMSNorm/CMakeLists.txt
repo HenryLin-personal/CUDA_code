@@ -14,6 +14,8 @@ add_executable(rmsnormcpu rmscpu.cc)
 add_executable(rmsnorm0 rms0.cu)
 add_executable(rmsnorm1 rms1.cu)
 add_executable(rmsnorm2 rms2.cu)
+add_executable(rmsnorm3 rms3.cu)
+add_executable(rmsnorm4 rms4.cu)
 
 message(STATUS "CMAKE_BUILD_TYPE = ${CMAKE_BUILD_TYPE}")
 
