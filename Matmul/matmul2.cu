@@ -22,8 +22,14 @@ constexpr int M = 4096;
 constexpr int N = 4096;
 constexpr int K = 4096;
 
-constexpr int BlockX = 16;
-constexpr int BlockY = 16;
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 8;
+constexpr int TM = 8;
+constexpr int TN = 8;
+
+constexpr int BlockX = BN / TN;
+constexpr int BlockY = BM / TM;
 constexpr int Warmup = 10;
 constexpr int Iters = 50;
 
@@ -108,6 +114,7 @@ private:
     cudaEvent_t event_{nullptr};
 };
 
+#define a_shm_transpose 0
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void matmul_v2(
     int m,
@@ -123,9 +130,6 @@ __global__ void matmul_v2(
     // const int by = blockIdx.y;
     // const int tx = threadIdx.x * TN;
     // const int ty = threadIdx.y * TM;
-
-    // __shared__ float As[BM * BK];
-    // __shared__ float Bs[BK * BN];
 
     // __shared__ float As_2d[BM][BK];
     // __shared__ float Bs_2d[BK][BN];
@@ -186,63 +190,96 @@ __global__ void matmul_v2(
     //     }
     // }
 
-    // 已有BM, BN, BK, TM, TN
-    // 4096^2个数据项，
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
-    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    const int thread_num = blockDim.x * blockDim.y;
-
-    a = &a[by * BM * k];
-    b = &b[bx * BN];
-    c = &c[by * BM * n + bx * BN];
-
-    __shared__ float As_2d[BM][BK];
-    __shared__ float Bs_2d[BK][BN];
-
-    const int tx = threadIdx.x * TN;
-    const int ty = threadIdx.y * TM;
+    const float *a_start = a + BM * blockIdx.y * k;
+    const float *b_start = b + BN * blockIdx.x;
+    // const int tx = threadIdx.x * TN;
+    // const int ty = threadIdx.y * TM;
+    const int tid = threadIdx.x + blockDim.x * threadIdx.y; // 展平为一维线程
+    constexpr int threads = (BM / TM) * (BN / TN); // 线程数量
     const int a_tile_row = tid / BK;
     const int a_tile_col = tid % BK;
-    const int a_tile_stride = thread_num / BK;
-
+    const int a_tile_stride = threads / BK;
     const int b_tile_row = tid / BN;
     const int b_tile_col = tid % BN;
-    const int b_tile_stride = thread_num / BN;
-    float accum[TM][TN] = {0.f};
-    for(int k_i = 0; k_i < k; k_i += BK, a += BK, b += n * BK)
+    const int b_tile_stride = threads / BN;
+
+    // __shared__ float a_shm[BM][BK];
+    __shared__ float a_shm_T[BK][BM];
+    __shared__ float b_shm[BK][BN];
+
+    float sum[TM][TN]{0.f};
+    float reg_a[TM]{0.f};
+    float reg_b[TN]{0.f};
+    for(size_t s = 0; s < k; s += BK)
     {
-        // 1. 搬运数据至共享显存
-        for(int i = 0; i < BM; i += a_tile_stride) {
-            As_2d[a_tile_row + i][a_tile_col] = a[(a_tile_row + i) * k + a_tile_col];
+        // 1. 线程块内线程读取global memory, 搬运进shared memory
+        // for(int i = 0; i < TN; ++i)
+        // {
+        //     for(int j = 0; j < BK; ++j)
+        //     {
+        //         // a_shm[ty + i][j] = a_start[(ty + i) * k + j + s];
+        //         // b_shm[j][tx + i] = b_start[(j + s) * n + tx + i];
+        //     }
+        // }
+
+        // 上面的方法把原本每个线程搬运4个元素增加到了搬运64个元素, 原因是tx和ty没有充分利用
+        for(int i = 0; i < BM; i += a_tile_stride)
+        {
+            #ifdef a_shm_transpose
+            a_shm_T[a_tile_col][a_tile_row + i] = a_start[(a_tile_row + i) * k + a_tile_col + s];
+            #else
+            a_shm[a_tile_row + i][a_tile_col] = a_start[(a_tile_row + i) * k + a_tile_col + s];
+            #endif
         }
-        for(int i = 0; i < BK; i += b_tile_stride) {
-            Bs_2d[b_tile_row + i][b_tile_col] = b[(b_tile_row + i) * n + b_tile_col];
+        for(int i = 0; i < BK; i += b_tile_stride)
+        {
+            b_shm[b_tile_row + i][b_tile_col] = b_start[(b_tile_row + i + s) * n + b_tile_col];
         }
         __syncthreads();
 
-        // 2. 共享显存求乘法
-        for(int i = 0; i < BK; i++)
+        // 2. (16, 16)线程读取a_shm[128][8] 和 b_shm[8][128], 分别负责[TM][TN]=[8][8]
+        // T(i, j)负责什么详见笔记
+        // for(int i = 0; i < TM; ++i)
+        // {
+        //     for(int j = 0; j < TN; ++j)
+        //     {
+        //         for(int inner = 0; inner < BK; ++inner)
+        //         {
+        //             sum[i][j] += a_shm[threadIdx.y + (BM / TM) * i][inner] * b_shm[inner][threadIdx.x + (BN / TN) * j];
+        //         }
+        //     }
+        // }
+
+        // 借助寄存器进一步降低共享显存带宽, 这一步将cublas ratio从20%飙升至50%
+        #pragma unroll
+        for(int inner = 0; inner < BK; ++inner)
         {
-            for(int j = 0; j < TM; j++)
+            #ifdef a_shm_transpose
+            for(int i = 0; i < TM; ++i) reg_a[i] = a_shm_T[inner][threadIdx.y + (BM / TM) * i]; // 取出a_shm的每一列元素
+            #else
+            for(int i = 0; i < TM; ++i) reg_a[i] = a_shm[threadIdx.y + (BM / TM) * i][inner]; // 取出a_shm的每一列元素
+            #endif
+
+            for(int j = 0; j < TN; ++j) reg_b[j] = b_shm[inner][threadIdx.x + (BN / TN) * j]; // 取出b_shm的每一行元素
+            for(int i = 0; i < TM; ++i)
             {
-                for(int l = 0; l < TN; l++)
+                for(int j = 0; j < TN; ++j)
                 {
-                    accum[j][l] += As_2d[ty + j][i] * Bs_2d[i][tx + l];
+                    sum[i][j] += reg_a[i] * reg_b[j];
                 }
             }
         }
         __syncthreads();
-
-        // 3. 更新至下一个循环
     }
-    // 4. accum写回C矩阵
-    for(int j = 0; j < TM; ++j)
+    // 3. 写回
+    float *c_start = c + BM * blockIdx.y * n + BN * blockIdx.x; 
+    for(int i = 0; i < TM; ++i)
     {
-        for(int l = 0; l < TN; ++l)
+        for(int j = 0; j < TN; ++j)
         {
-            float &cur = c[(ty + j) * n + tx + l];
-            cur = alpha * accum[j][l] + beta * cur;
+            const int cx = threadIdx.x + (BN / TN) * j;
+            const int cy = threadIdx.y + (BM / TM) * i;
+            c_start[cy * n + cx] = alpha * sum[i][j] + beta * c_start[cy * n + cx];
         }
     }
 }
@@ -384,6 +421,10 @@ int main()
 {
     try {
         setDevice();
+        static_assert(M % BM == 0 && N % BN == 0 && K % BK == 0,
+            "kernel has no boundary checks");
+        static_assert((BM * BK + BK * BN) * sizeof(float) <= 48 * 1024,
+                "static shared memory exceeds 48 KB");
 
         const std::size_t a_count =
             static_cast<std::size_t>(M) * static_cast<std::size_t>(K);
@@ -429,8 +470,8 @@ int main()
         check_cuda(cudaMemset(device_v2.get(), 0, c_bytes), "clear v2 C");
 
         CublasHandle cublas;
-        const dim3 block(16, 16);
-        const dim3 grid(ceil_div(N, 128), ceil_div(M, 128));
+        const dim3 block(BlockX, BlockY);
+        const dim3 grid(ceil_div(N, BN), ceil_div(M, BM));
 
         const float cublas_ms = benchmark_gpu([&] {
             run_cublas_row_major(
@@ -447,7 +488,7 @@ int main()
         });
 
         const float v2_ms = benchmark_gpu([&] {
-            matmul_v2<128, 128, 8, 8, 8><<<grid, block>>>(
+            matmul_v2<BM, BN, BK, TM, TN><<<grid, block>>>(
                 M,
                 N,
                 K,

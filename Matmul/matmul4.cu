@@ -24,8 +24,14 @@ constexpr int M = 4096;
 constexpr int N = 4096;
 constexpr int K = 4096;
 
-constexpr int BlockX = 16;
-constexpr int BlockY = 16;
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 8;
+constexpr int TM = 8;
+constexpr int TN = 8;
+
+constexpr int BlockX = BN / TN;
+constexpr int BlockY = BM / TM;
 constexpr int Warmup = 10;
 constexpr int Iters = 50;
 
@@ -121,16 +127,142 @@ __global__ void matmul_v4(
     float beta,
     float *c)
 {
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
-    const int tx = threadIdx.x * TN;
-    const int ty = threadIdx.y * TM;
-    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const float *a_start = a + BM * blockIdx.y * k;
+    const float *b_start = b + BN * blockIdx.x;
+    const int tid = threadIdx.x + blockDim.x * threadIdx.y; // 展平为一维线程
+    constexpr int threads = (BM / TM) * (BN / TN); // 线程数量
+    const int a_tile_row = tid / (BK / 4);
+    const int a_tile_col = tid % (BK / 4) * 4;
+    constexpr int a_tile_stride = threads / (BK / 4);  // 16 * 16 / (8 / 4) = 128
+    const int b_tile_row = tid / (BN / 4);
+    const int b_tile_col = tid % (BN / 4) * 4;
+    constexpr int b_tile_stride = threads / (BN / 4);  // 16 * 16 / (128 / 4) = 8
+    constexpr int a_ldg_num = BM / a_tile_stride; // 每个线程每个 tile 搬 A 的 float4 个数: 128 / 128 = 1
+    constexpr int b_ldg_num = BK / b_tile_stride; // 每个线程每个 tile 搬 B 的 float4 个数: 8 / 8 = 1
 
-    __shared__ float As_2D_T[2][BK][TM];
-    __shared__ float Bs_2D[2][BK][TN];
+    // 双缓冲: [0]/[1] 两份 shared memory, 一份在算, 另一份在装下一个 tile
+    __shared__ float a_shm_T[2][BK][BM];
+    __shared__ float b_shm[2][BK][BN];
 
-    
+    float sum[TM][TN]{0.f};
+    float reg_a[TM];
+    float reg_b[TN];
+    // 下一个 tile 从 global 读进来先暂存在寄存器里, 算完当前 tile 再写进 shared
+    float4 a_ldg[a_ldg_num];
+    float4 b_ldg[b_ldg_num];
+
+    // 0. 预取第 0 个 tile 到 buffer 0
+    #pragma unroll
+    for(int i = 0; i < BM; i += a_tile_stride)
+    {
+        float4 va = LOAD_FLOAT4(a_start[(a_tile_row + i) * k + a_tile_col]);
+        a_shm_T[0][a_tile_col][a_tile_row + i] = va.x;
+        a_shm_T[0][a_tile_col + 1][a_tile_row + i] = va.y;
+        a_shm_T[0][a_tile_col + 2][a_tile_row + i] = va.z;
+        a_shm_T[0][a_tile_col + 3][a_tile_row + i] = va.w;
+    }
+    // for(int i = 0; i < a_ldg_num; ++i)
+    // {
+    //     const int row = a_tile_row + i * a_tile_stride;
+    //     float4 va = LOAD_FLOAT4(a_start[row * k + a_tile_col]);
+    //     a_shm_T[0][a_tile_col][row] = va.x;
+    //     a_shm_T[0][a_tile_col + 1][row] = va.y;
+    //     a_shm_T[0][a_tile_col + 2][row] = va.z;
+    //     a_shm_T[0][a_tile_col + 3][row] = va.w;
+    // }
+    #pragma unroll
+    // for(int j = 0; j < b_ldg_num; ++j)
+    // {
+    //     const int row = b_tile_row + j * b_tile_stride;
+    //     STORE_FLOAT4(b_shm[0][row][b_tile_col]) = LOAD_FLOAT4(b_start[row * n + b_tile_col]);
+    // }
+    for(int j = 0; j < BK; j += b_tile_stride)
+    {
+        STORE_FLOAT4(b_shm[0][b_tile_row + j][b_tile_col]) = LOAD_FLOAT4(b_start[(b_tile_row + j) * n + b_tile_col]);
+    }
+
+
+    __syncthreads();
+
+    int read_idx = 0; // 当前用来计算的 buffer
+    for(int s = 0; s < k; s += BK)
+    {
+        const int next = s + BK;
+        const bool has_next = next < k;
+
+        // 1. 先发出下一个 tile 的 global 读取, 只写寄存器不碰 shared,
+        //    LDG 的几百个周期延迟被下面的计算掩盖
+        if(has_next)
+        {
+            #pragma unroll
+            for(int i = 0; i < a_ldg_num; ++i)
+            {
+                a_ldg[i] = LOAD_FLOAT4(a_start[(a_tile_row + i * a_tile_stride) * k + a_tile_col + next]);
+            }
+            #pragma unroll
+            for(int j = 0; j < b_ldg_num; ++j)
+            {
+                b_ldg[j] = LOAD_FLOAT4(b_start[(b_tile_row + j * b_tile_stride + next) * n + b_tile_col]);
+            }
+        }
+
+        // 2. 用 buffer read_idx 计算, 和 v3 相同
+        #pragma unroll
+        for(int inner = 0; inner < BK; ++inner)
+        {
+            for(int i = 0; i < TM / 4; i++) STORE_FLOAT4(reg_a[i * 4]) = LOAD_FLOAT4(a_shm_T[read_idx][inner][(threadIdx.y + (BM / TM) * i) * 4]);
+            for(int j = 0; j < TN / 4; j++) STORE_FLOAT4(reg_b[j * 4]) = LOAD_FLOAT4(b_shm[read_idx][inner][(threadIdx.x + (BN / TN) * j) * 4]);
+            for(int i = 0; i < TM; ++i)
+            {
+                for(int j = 0; j < TN; ++j)
+                {
+                    sum[i][j] += reg_a[i] * reg_b[j];
+                }
+            }
+        }
+
+        // 3. 把寄存器里的下一个 tile 写进另一个 buffer, 同步一次后交换
+        //    写的是 read_idx ^ 1, 和正在被读的 buffer 不冲突, 所以每个 tile 只需要这一次 __syncthreads()
+        if(has_next)
+        {
+            const int write_idx = read_idx ^ 1; // read_idx初始化为0, write_idx初始化为0 ^ 1 = 1
+            #pragma unroll
+            for(int i = 0; i < a_ldg_num; ++i)
+            {
+                const int row = a_tile_row + i * a_tile_stride;
+                a_shm_T[write_idx][a_tile_col][row] = a_ldg[i].x;
+                a_shm_T[write_idx][a_tile_col + 1][row] = a_ldg[i].y;
+                a_shm_T[write_idx][a_tile_col + 2][row] = a_ldg[i].z;
+                a_shm_T[write_idx][a_tile_col + 3][row] = a_ldg[i].w;
+            }
+            #pragma unroll
+            for(int j = 0; j < b_ldg_num; ++j)
+            {
+                STORE_FLOAT4(b_shm[write_idx][b_tile_row + j * b_tile_stride][b_tile_col]) = b_ldg[j];
+            }
+            __syncthreads();
+            read_idx = write_idx; // read_idx变为1, write_idx下次变为1 ^ 1 = 0; read_idx变为0, write_idx下次变为0 ^ 1 = 1
+        }
+    }
+
+    // 4. 写回, 和 v3 相同
+    float *c_start = c + BM * blockIdx.y * n + BN * blockIdx.x;
+    #pragma unroll
+    for (int i = 0; i < TM; ++i)
+    {
+        const int cy = threadIdx.y * 4 + (BM / TM) * 4 * (i / 4) + i % 4;
+        #pragma unroll
+        for (int j = 0; j < TN; j += 4)
+        {
+            const int cx = threadIdx.x * 4 + (BN / TN) * 4 * (j / 4);
+            float4 cv = LOAD_FLOAT4(c_start[cy * n + cx]);
+            cv.x = alpha * sum[i][j + 0] + beta * cv.x;
+            cv.y = alpha * sum[i][j + 1] + beta * cv.y;
+            cv.z = alpha * sum[i][j + 2] + beta * cv.z;
+            cv.w = alpha * sum[i][j + 3] + beta * cv.w;
+            STORE_FLOAT4(c_start[cy * n + cx]) = cv;
+        }
+    }
 }
 
 void run_cublas_row_major(
@@ -333,7 +465,7 @@ int main()
         });
 
         const float v4_ms = benchmark_gpu([&] {
-            matmul_v4<128, 128, 8, 8, 8><<<grid, block>>>(
+            matmul_v4<BM, BN, BK, TM, TN><<<grid, block>>>(
                 M,
                 N,
                 K,

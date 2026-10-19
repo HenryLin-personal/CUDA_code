@@ -18,13 +18,17 @@ namespace {
 
 // Row-major matrix layout:
 // A: M x K, B: K x N, C: M x N.
-constexpr int M = 1024;
-constexpr int N = 1024;
-constexpr int K = 1024;
+constexpr int M = 4096;
+constexpr int N = 4096;
+constexpr int K = 4096;
 
-// v0 follows the course baseline: one 32 x 32 block computes one output tile.
-constexpr int BlockX = 32;
-constexpr int BlockY = 32;
+// v0: one thread computes one output, so one block has BM x BN threads.
+// There is no shared memory, so there is no BK.
+constexpr int BM = 32;
+constexpr int BN = 32;
+constexpr int BlockX = BN;
+constexpr int BlockY = BM;
+static_assert(BlockX * BlockY <= 1024, "threads per block must not exceed 1024");
 constexpr int Warmup = 10;
 constexpr int Iters = 50;
 
@@ -122,28 +126,40 @@ __global__ void matmul_v0(
     float beta,
     float *c)
 {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    // const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    // const int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (row >= m || col >= n) {
-        return;
+    // if (row >= m || col >= n) {
+    //     return;
+    // }
+
+    // float sum = 0.0f;
+    // for (int inner = 0; inner < k; ++inner) {
+    //     const std::size_t a_index =
+    //         static_cast<std::size_t>(row) * static_cast<std::size_t>(k) +
+    //         static_cast<std::size_t>(inner);
+    //     const std::size_t b_index =
+    //         static_cast<std::size_t>(inner) * static_cast<std::size_t>(n) +
+    //         static_cast<std::size_t>(col);
+    //     sum += a[a_index] * b[b_index];
+    // }
+
+    // const std::size_t output_index =
+    //     static_cast<std::size_t>(row) * static_cast<std::size_t>(n) +
+    //     static_cast<std::size_t>(col);
+    // c[output_index] = alpha * sum + beta * c[output_index];
+
+    const float *a_start = a + blockIdx.y * blockDim.y * k;
+    const float *b_start = b + blockIdx.x * blockDim.x;
+    const int x = threadIdx.x + blockDim.x * blockIdx.x;
+    const int y = threadIdx.y + blockDim.y * blockIdx.y;
+    
+    float sum = 0.f;
+    for(int inner = 0; inner < k; ++inner)
+    {
+        sum += a_start[threadIdx.y * k + inner] * b_start[inner * n + threadIdx.x];
     }
-
-    float sum = 0.0f;
-    for (int inner = 0; inner < k; ++inner) {
-        const std::size_t a_index =
-            static_cast<std::size_t>(row) * static_cast<std::size_t>(k) +
-            static_cast<std::size_t>(inner);
-        const std::size_t b_index =
-            static_cast<std::size_t>(inner) * static_cast<std::size_t>(n) +
-            static_cast<std::size_t>(col);
-        sum += a[a_index] * b[b_index];
-    }
-
-    const std::size_t output_index =
-        static_cast<std::size_t>(row) * static_cast<std::size_t>(n) +
-        static_cast<std::size_t>(col);
-    c[output_index] = alpha * sum + beta * c[output_index];
+    c[y * n + x] = alpha * sum + beta * c[y * n + x];
 }
 
 void run_cublas_row_major(
@@ -329,7 +345,7 @@ int main()
 
         CublasHandle cublas;
         const dim3 block(BlockX, BlockY);
-        const dim3 grid(ceil_div(N, BlockX), ceil_div(M, BlockY));
+        const dim3 grid(ceil_div(N, BN), ceil_div(M, BM));
 
         const float cublas_ms = benchmark_gpu([&] {
             run_cublas_row_major(

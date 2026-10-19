@@ -18,13 +18,21 @@ namespace {
 
 // Row-major matrix layout:
 // A: M x K, B: K x N, C: M x N.
-constexpr int M = 1024;
-constexpr int N = 1024;
-constexpr int K = 1024;
+constexpr int M = 4096;
+constexpr int N = 4096;
+constexpr int K = 4096;
 
-// v1 follows the course baseline: one 32 x 32 block computes one output tile.
-constexpr int BlockX = 32;
-constexpr int BlockY = 32;
+// v1: one thread computes one output, so one block has BM x BN threads.
+// BM * BN must not exceed 1024 (max threads per block), and the load mapping
+// a_shm[ty][tx] / b_shm[ty][tx] requires BM == BN == BK.
+constexpr int BM = 32;
+constexpr int BN = 32;
+constexpr int BK = 32;
+constexpr int BlockX = BN;
+constexpr int BlockY = BM;
+static_assert(BM == BN && BN == BK, "v1 load mapping requires BM == BN == BK");
+static_assert(BlockX * BlockY <= 1024, "threads per block must not exceed 1024");
+static_assert(M % BM == 0 && N % BN == 0 && K % BK == 0, "kernel has no boundary checks");
 constexpr int Warmup = 10;
 constexpr int Iters = 50;
 
@@ -109,53 +117,76 @@ private:
     cudaEvent_t event_{nullptr};
 };
 
-template <const int BLOCK_SIZE>
+template <const int BM, const int BN, const int BK>
 __global__ void matmul_v1(
-    int m,
-    int n,
-    int k,
+    int m, int n, int k,
     float alpha,
     const float *a,
     const float *b,
     float beta,
     float *c)
 {
-    const int BM = BLOCK_SIZE;
-    const int BN = BLOCK_SIZE;
-    const int BK = BLOCK_SIZE;
+    // const int BM = BLOCK_SIZE;
+    // const int BN = BLOCK_SIZE;
+    // const int BK = BLOCK_SIZE;
 
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
+    // const int bx = blockIdx.x;
+    // const int by = blockIdx.y;
+    // const int tx = threadIdx.x;
+    // const int ty = threadIdx.y;
 
-    __shared__ float As[BM * BK];
-    __shared__ float Bs[BK * BN];
+    // __shared__ float As[BM * BK];
+    // __shared__ float Bs[BK * BN];
 
-    a = &a[by * BM * k];
-    b = &b[bx * BN];
-    c = &c[by * BM * n + bx * BN];
+    // a = &a[by * BM * k];
+    // b = &b[bx * BN];
+    // c = &c[by * BM * n + bx * BN];
+
+    // float sum = 0.f;
+    // for(int k_i = 0; k_i < k; k_i += BK)
+    // {
+    //     // 1. 线程复制数据到共享内存
+    //     As[ty * BK + tx] = a[ty * k + tx];
+    //     Bs[ty * BN + tx] = b[ty * n + tx];
+    //     __syncthreads();
+
+    //     // 2. 复用matmul0中的矩阵乘法逻辑
+    //     for(int i = 0; i < BK; ++i)
+    //     {
+    //         sum += As[ty * BK + i] * Bs[i * BN + tx];
+    //     }
+    //     __syncthreads();
+
+    //     // 3. 更新A和B
+    //     a += BK; b += n * BK;
+    // }
+    // // 4. 将结果传回c矩阵
+    // c[ty * n + tx] = alpha * sum + beta * c[ty * n + tx];
+
+    const int x = threadIdx.x + blockDim.x * blockIdx.x;
+    const int y = threadIdx.y + blockDim.y * blockIdx.y;
+    const float *a_start = a + blockDim.y * blockIdx.y * k;
+    const float *b_start = b + blockDim.x * blockIdx.x;
+    
+    __shared__ float a_shm[BM][BK];
+    __shared__ float b_shm[BK][BN];
 
     float sum = 0.f;
-    for(int k_i = 0; k_i < k; k_i += BK)
+    // 循环k / BK 次
+    for(size_t s = 0; s < k; s += BK)
     {
-        // 1. 线程复制数据到共享内存
-        As[ty * BK + tx] = a[ty * k + tx];
-        Bs[ty * BN + tx] = b[ty * n + tx];
+        // 1. 线程块内线程读取global memory, 搬运进shared memory
+        a_shm[threadIdx.y][threadIdx.x] = a_start[threadIdx.y * k + threadIdx.x + s];
+        b_shm[threadIdx.y][threadIdx.x] = b_start[(threadIdx.y + s) * n + threadIdx.x];
         __syncthreads();
-
-        // 2. 复用matmul0中的矩阵乘法逻辑
-        for(int i = 0; i < BK; ++i)
+  
+        for(int inner = 0; inner < BK; ++inner)
         {
-            sum += As[ty * BK + i] * Bs[i * BN + tx];
+            sum += a_shm[threadIdx.y][inner] * b_shm[inner][threadIdx.x];
         }
         __syncthreads();
-
-        // 3. 更新A和B
-        a += BK; b += n * BK;
     }
-    // 4. 将结果传回c矩阵
-    c[ty * n + tx] = alpha * sum + beta * c[ty * n + tx];
+    c[y * n + x] = alpha * sum + beta * c[y * n + x];
 }
 
 void run_cublas_row_major(
@@ -341,7 +372,7 @@ int main()
 
         CublasHandle cublas;
         const dim3 block(BlockX, BlockY);
-        const dim3 grid(ceil_div(N, BlockX), ceil_div(M, BlockY));
+        const dim3 grid(ceil_div(N, BN), ceil_div(M, BM));
 
         const float cublas_ms = benchmark_gpu([&] {
             run_cublas_row_major(
@@ -358,10 +389,8 @@ int main()
         });
 
         const float v1_ms = benchmark_gpu([&] {
-            matmul_v1<32><<<grid, block>>>(
-                M,
-                N,
-                K,
+            matmul_v1<BM, BN, BK><<<grid, block>>>(
+                M, N, K,
                 Alpha,
                 device_a.get(),
                 device_b.get(),

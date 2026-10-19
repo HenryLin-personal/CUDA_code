@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(matmul LANGUAGES CXX CUDA)
+set(CMAKE_CUDA_ARCHITECTURES 120)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # 导出一份编译命令
 set(CMAKE_CUDA_STANDARD 17) # 用于指定CUDA编译器应使用的CUDA C++标准的版本
 set(CMAKE_CUDA_STANDARD_REQUIRED ON) # 表明如果找不到指定版本的CUDA编译器，将发出错误
@@ -22,6 +23,10 @@ target_link_libraries(matmulv2 PRIVATE CUDA::cublas)
 add_executable(matmul_cpu matmul_cpu.cc)
 add_executable(matmulv3 matmul3.cu)
 target_link_libraries(matmulv3 PRIVATE CUDA::cublas)
+add_executable(matmulv4 matmul4.cu)
+target_link_libraries(matmulv4 PRIVATE CUDA::cublas)
+add_executable(matmulv5 matmul5.cu)
+target_link_libraries(matmulv5 PRIVATE CUDA::cublas)
 
 message(STATUS "CMAKE_BUILD_TYPE = ${CMAKE_BUILD_TYPE}")
 

@@ -24,8 +24,14 @@ constexpr int M = 4096;
 constexpr int N = 4096;
 constexpr int K = 4096;
 
-constexpr int BlockX = 16;
-constexpr int BlockY = 16;
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 8;
+constexpr int TM = 8;
+constexpr int TN = 8;
+
+constexpr int BlockX = BN / TN;
+constexpr int BlockY = BM / TM;
 constexpr int Warmup = 10;
 constexpr int Iters = 50;
 
@@ -205,88 +211,75 @@ __global__ void matmul_v3(
     // }
 
 
-    // 4096^2个数据, 每个block处理128^2个数据, 需要32^2个block, 每个block有16^2个线程, 每个线程处理8^2个数据
-    const int bx = blockIdx.x;
-    const int by = blockIdx.y;
-    a = &a[by * BM * K];
-    b = &b[bx * BN];
-    c = &c[by * BM * k + bx * BN];
+    const float *a_start = a + BM * blockIdx.y * k;
+    const float *b_start = b + BN * blockIdx.x;
+    const int tid = threadIdx.x + blockDim.x * threadIdx.y; // 展平为一维线程
+    constexpr int threads = (BM / TM) * (BN / TN); // 线程数量
+    const int a_tile_row = tid / (BK / 4);
+    const int a_tile_col = tid % (BK / 4) * 4;
+    const int a_tile_stride = threads / (BK / 4);
 
-    const int tx = threadIdx.x * TN;
-    const int ty = threadIdx.y * TM;
-    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    const int thread_num = (BM / TM) * (BN / TN);
-    const int V = 4;
+    const int b_tile_row = tid / (BN / 4); 
+    const int b_tile_col = tid % (BN / 4) * 4;
+    const int b_tile_stride = threads / (BN / 4);
 
-    __shared__ float As_2D_T[BK][BM];
-    __shared__ float Bs_2D[BK][BN];
+    __shared__ float a_shm_T[BK][BM];
+    __shared__ float b_shm[BK][BN];
 
-    const int ldg_a_num = BM * BK / thread_num / V; // 128 * 128 / 256 / 4 = 16组，共64个float
-    int a_tile_row = tid / (BK / V);
-    int a_tile_col = (tid % (BK / V)) * V;
-    int a_tile_stride = BM / ldg_a_num;
-
-    const int ldg_b_num = BK * BN / thread_num / V; // 128 * 128 / 256 / 4 = 16组，共64个float
-    int b_tile_row = tid / (BN / V); 
-    int b_tile_col = (tid % (BN / V)) * V;
-    int b_tile_stride = BK / ldg_b_num;
-
-    float4 a_reg[ldg_a_num];
-    float a_flag[TM];
-    float b_flag[TN];
-    float accum[TM][TN]{0.f};
-    for(int k_i = 0; k_i < k; k_i += BK)
+    float sum[TM][TN]{0.f};
+    float reg_a[TM]{0.f};
+    float reg_b[TN]{0.f};
+    for(size_t s = 0; s < k; s += BK)
     {
-        // 1. 线程复制数据到共享内存
-        for(int i = 0; i < BM; i += a_tile_stride) 
+        // T(0,0) a_start[0][0~3] -> a_shm_T[0~3][0]
+        //        a_start[128][0~3] -> a_shm_T[0~3][128]    a_tile_stride = 16 * 16 / (8 / 4) = 128
+        //        ...
+        // 
+        for(int i = 0; i < BM; i += a_tile_stride)
         {
-            int ldg_index = i / a_tile_stride;
-            a_reg[ldg_index] = LOAD_FLOAT4(a[(a_tile_row + i) * k + a_tile_col]);
-            As_2D_T[a_tile_col][i + a_tile_row] = a_reg[ldg_index].x;
-            As_2D_T[a_tile_col + 1][i + a_tile_row] = a_reg[ldg_index].y;
-            As_2D_T[a_tile_col + 2][i + a_tile_row] = a_reg[ldg_index].z;
-            As_2D_T[a_tile_col + 3][i + a_tile_row] = a_reg[ldg_index].w;
+            float4 va = LOAD_FLOAT4(a_start[(a_tile_row + i) * k + a_tile_col + s]);
+            a_shm_T[a_tile_col][a_tile_row + i] = va.x;
+            a_shm_T[a_tile_col + 1][a_tile_row + i] = va.y;
+            a_shm_T[a_tile_col + 2][a_tile_row + i] = va.z;
+            a_shm_T[a_tile_col + 3][a_tile_row + i] = va.w;
         }
-        for(int i = 0; i < BK; i += b_tile_stride) 
+        for(int j = 0; j < BK; j += b_tile_stride)
         {
-            STORE_FLOAT4(Bs_2D[b_tile_row + i][b_tile_col]) = LOAD_FLOAT4(b[(b_tile_row + i) * n + b_tile_col]);
+            STORE_FLOAT4(b_shm[b_tile_row + j][b_tile_col]) = LOAD_FLOAT4(b_start[(b_tile_row + j + s) * n + b_tile_col]);
         }
         __syncthreads();
 
-        // 2. 复用matmul0中的矩阵乘法逻辑
-        for(int i = 0; i < BK; ++i)
+        #pragma unroll
+        for(int inner = 0; inner < BK; ++inner)
         {
-            for(int l = 0; l < TM; l += V) {
-                STORE_FLOAT4(a_flag[l]) = LOAD_FLOAT4(As_2D_T[i][ty + l]);
-            }
-            for(int m = 0; m < TN; m += V) {
-                STORE_FLOAT4(b_flag[m]) = LOAD_FLOAT4(Bs_2D[i][tx + m]);
-            }
+            for(int i = 0; i < TM; i += 4) STORE_FLOAT4(reg_a[i]) = LOAD_FLOAT4(a_shm_T[inner][threadIdx.y * 4 + (BM / TM) * i]); 
+            for(int j = 0; j < TN; j += 4) STORE_FLOAT4(reg_b[j]) = LOAD_FLOAT4(b_shm[inner][threadIdx.x * 4+ (BN / TN) * j]);
+        
 
-            for(int l = 0; l < TM; ++l)
+            for(int i = 0; i < TM; ++i)
             {
-                for(int m = 0; m < TN; ++m)
+                for(int j = 0; j < TN; ++j)
                 {
-                    accum[l][m] += a_flag[l] * b_flag[m];
+                    sum[i][j] += reg_a[i] * reg_b[j];
                 }
             }
         }
         __syncthreads();
-
-        // 3. 
-        a += BK; b += n * BK;
     }
-
-    for(int l = 0; l < TM; ++l)
+    // 3. 写回的坐标映射反推详见笔记
+    float *c_start = c + BM * blockIdx.y * n + BN * blockIdx.x;
+    for (int i = 0; i < TM; ++i)
     {
-        for(int m = 0; m < TN; m += V)
+        const int cy = threadIdx.y * 4 + (BM / TM) * (i / 4) * 4 + i % 4;
+        for (int j = 0; j < TN; j += 4)
         {
-            float4 cur = LOAD_FLOAT4(c[(ty + l) * n + tx + m]);
-            cur.x = alpha * accum[l][m] + beta * cur.x;
-            cur.y = alpha * accum[l][m + 1] + beta * cur.y;
-            cur.z = alpha * accum[l][m + 2] + beta * cur.z;
-            cur.w = alpha * accum[l][m + 3] + beta * cur.w;
-            STORE_FLOAT4(c[(ty + l) * n + tx + m]) = cur;
+            const int cx = threadIdx.x * 4 + (BN / TN) * j;
+            float4 cv = LOAD_FLOAT4(c_start[cy * n + cx]);
+            cv.x = alpha * sum[i][j + 0] + beta * cv.x;
+            cv.y = alpha * sum[i][j + 1] + beta * cv.y;
+            cv.z = alpha * sum[i][j + 2] + beta * cv.z;
+            cv.w = alpha * sum[i][j + 3] + beta * cv.w;
+            STORE_FLOAT4(c_start[cy * n + cx]) = cv;
         }
     }
 }
@@ -491,7 +484,7 @@ int main()
         });
 
         const float v3_ms = benchmark_gpu([&] {
-            matmul_v3<128, 128, 8, 8, 8><<<grid, block>>>(
+            matmul_v3<BM, BN, BK, TM, TN><<<grid, block>>>(
                 M,
                 N,
                 K,
