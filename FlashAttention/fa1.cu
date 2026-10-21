@@ -17,7 +17,7 @@ namespace
     constexpr size_t bytes = count * sizeof(float);
     constexpr int loops = 10;
 
-    constexpr int Br = 64;    // 每个 block 负责的 Q 行数 = block 内线程数
+    constexpr int Br = 64;    // 一维线程模型, 每个 block 负责的 Q 行数 = block 内线程数
     constexpr int Bc = 32;    // 每次从 K/V 搬进 smem 的行数
 }
 
@@ -25,105 +25,149 @@ namespace
 // grid(N/Br, BH) = (16, 8) = 128个线程块, 每个线程块 Br=64 个线程 = 2个warp
 // 一个线程负责 Q 的一整行: 线程内部执行的就是 CPU 上推导的单遍 online softmax, 不需要跨线程规约
 // Br, Bc, D 必须是编译期常量: q_reg[D], acc[D], s[Bc] 的下标在 #pragma unroll 展开后全是常量, 才能放进寄存器,
-// 否则会被放到 local memory (显存). 可以用 nvcc -Xptxas -v 检查 "0 bytes stack frame"
-template <int Br, int Bc, int D>
+// 否则会被放到 local memory (显存). 可以用 nvcc -Xptxas -v 检查 "0 bytes stack frame" 
+template <int Br, int Bc, int D, int N>
 __global__ void flash_attn_v1(const float *q, const float *k, const float *v, float *o,
-                              int N, float scale, bool causal)
+                              float scale, bool causal)
 {
-    __shared__ float sK[Bc][D];
-    __shared__ float sV[Bc][D];
+//     __shared__ float sK[Bc][D];
+//     __shared__ float sV[Bc][D];
 
-    const int tid = threadIdx.x;
+//     const int tid = threadIdx.x;
+//     const int bh = blockIdx.y;
+//     const int row = blockIdx.x * Br + tid;  // 本线程负责的 Q 行
+//     // 越界的行不能提前 return: 它们仍要参与搬运 K/V 和 __syncthreads, 只是最后不写 O
+//     const bool valid = row < N;
+
+//     const float *Q = q + static_cast<size_t>(bh) * N * D;
+//     const float *K = k + static_cast<size_t>(bh) * N * D;
+//     const float *V = v + static_cast<size_t>(bh) * N * D;
+//     float *O = o + static_cast<size_t>(bh) * N * D;
+
+//     // Q 的一行放寄存器 (加载时直接乘上 scale), 整个 K/V 循环中复用
+//     // 不放 smem 的原因: sQ[tid][x] 相邻线程相隔 D=64 个 float, 正好落在同一个 bank, 32 路 bank conflict
+//     float q_reg[D];
+//     float acc[D];             // 未归一化的 O 行
+//     float m = -INFINITY;      // 当前行最大值
+//     float l = 0.f;            // 以 m 为基准的指数和
+// #pragma unroll
+//     for (int x = 0; x < D; ++x) {
+//         q_reg[x] = valid ? Q[row * D + x] * scale : 0.f;
+//         acc[x] = 0.f;
+//     }
+
+//     // causal: 本 block 最后一行是 (blockIdx.x + 1) * Br - 1, 之后的 K/V tile 对本 block 所有行都被 mask, 直接跳过
+//     const int kv_end = causal ? min(N, (blockIdx.x + 1) * Br) : N;
+
+//     for (int kv_start = 0; kv_start < kv_end; kv_start += Bc) {
+//         // 1. 搬运 K/V tile 到 smem
+//         __syncthreads(); // 等所有线程用完上一个 tile, 才能覆盖 sK/sV
+//         // Br=64 个线程合作搬 Bc*D = 32*64 = 2048 个 float, 每个线程搬 32 个
+//         // 例: 第一次循环 idx = tid, tid 0~63 搬 K[kv_start+0][0~63]; warp 0 读 K 第 kv_start 行的 0~31 列, 128B 连续 = 4个sector
+//         for (int idx = tid; idx < Bc * D; idx += Br) {
+//             const int r = idx / D;
+//             const int c = idx % D;
+//             const int kv_row = kv_start + r;
+//             sK[r][c] = kv_row < N ? K[kv_row * D + c] : 0.f;
+//             sV[r][c] = kv_row < N ? V[kv_row * D + c] : 0.f;
+//         }
+//         __syncthreads(); // 等搬运完成
+
+//         // 2. S 的一行 tile: s[c] = q·K[kv_start+c], 并求 tile 内最大值
+//         // 读 sK[c][x]: 同一时刻 warp 内所有线程读同一地址 -> 广播, 没有 bank conflict
+//         float s[Bc];
+//         float tile_max = -INFINITY;
+// #pragma unroll
+//         for (int c = 0; c < Bc; ++c) {
+//             float dot = 0.f;
+// #pragma unroll
+//             for (int x = 0; x < D; ++x) {
+//                 dot += q_reg[x] * sK[c][x];
+//             }
+//             const int j = kv_start + c;
+//             // 越界列 (N 不是 Bc 的倍数) 和 causal 的上三角都设为 -inf, exp 后为 0
+//             s[c] = (j >= N || (causal && j > row)) ? -INFINITY : dot;
+//             tile_max = fmaxf(tile_max, s[c]);
+//         }
+
+//         // 3. online softmax: 更新 m, l, 并求修正系数 alpha
+//         // 第一个 tile 时 m = -inf, alpha = exp(-inf) = 0, 旧值被自然清掉
+//         // 第一个 tile 一定包含 j = 0, 之后 m 都是有限值, 即使整个 tile 被 mask 也不会出现 -inf - (-inf) = NaN
+//         const float m_new = fmaxf(m, tile_max);
+//         const float alpha = expf(m - m_new);
+//         float tile_sum = 0.f;
+// #pragma unroll
+//         for (int c = 0; c < Bc; ++c) {
+//             s[c] = expf(s[c] - m_new); // 未归一化的 P
+//             tile_sum += s[c];
+//         }
+//         l = alpha * l + tile_sum;
+
+//         // 4. O = alpha * O + P·V_tile
+//         // 读 sV[c][x]: 同样是 warp 内所有线程读同一地址 -> 广播
+// #pragma unroll
+//         for (int x = 0; x < D; ++x) {
+//             float t = acc[x] * alpha;
+// #pragma unroll
+//             for (int c = 0; c < Bc; ++c) {
+//                 t += s[c] * sV[c][x];
+//             }
+//             acc[x] = t;
+//         }
+//         m = m_new;
+//     }
+
+//     // 5. 最后统一归一化一次
+//     if (valid) {
+//         const float inv = 1.f / l;
+// #pragma unroll
+//         for (int x = 0; x < D; ++x) {
+//             O[row * D + x] = acc[x] * inv;
+//         }
+//     }
+
     const int bh = blockIdx.y;
-    const int row = blockIdx.x * Br + tid;  // 本线程负责的 Q 行
-    // 越界的行不能提前 return: 它们仍要参与搬运 K/V 和 __syncthreads, 只是最后不写 O
-    const bool valid = row < N;
-
     const float *Q = q + static_cast<size_t>(bh) * N * D;
     const float *K = k + static_cast<size_t>(bh) * N * D;
     const float *V = v + static_cast<size_t>(bh) * N * D;
     float *O = o + static_cast<size_t>(bh) * N * D;
 
-    // Q 的一行放寄存器 (加载时直接乘上 scale), 整个 K/V 循环中复用
-    // 不放 smem 的原因: sQ[tid][x] 相邻线程相隔 D=64 个 float, 正好落在同一个 bank, 32 路 bank conflict
-    float q_reg[D];
-    float acc[D];             // 未归一化的 O 行
-    float m = -INFINITY;      // 当前行最大值
-    float l = 0.f;            // 以 m 为基准的指数和
-#pragma unroll
-    for (int x = 0; x < D; ++x) {
-        q_reg[x] = valid ? Q[row * D + x] * scale : 0.f;
-        acc[x] = 0.f;
+    // Q有1024行, 每个线程块负责Br=64行, 线程块内有Br=64个线程, 每个线程负责一行, 将每一行(D个数据)的数据存入寄存器q_reg[D]
+    float q_reg[D]; // D * 4B
+    float acc[D];
+    
+    const int row = blockIdx.x * Br + threadIdx.x;  // 本线程负责的 Q 行, Br=blockDim.x
+    if(row >= N) return;   // 假如N不是64的倍数, N=96, 那第二个线程块的后32个线程直接返回
+    for (int col = 0; col < D; ++col) {
+        q_reg[col] = Q[row * D + col] * scale;
+        acc[col] = 0.f;
     }
 
-    // causal: 本 block 最后一行是 (blockIdx.x + 1) * Br - 1, 之后的 K/V tile 对本 block 所有行都被 mask, 直接跳过
-    const int kv_end = causal ? min(N, (blockIdx.x + 1) * Br) : N;
-
-    for (int kv_start = 0; kv_start < kv_end; kv_start += Bc) {
-        // 1. 搬运 K/V tile 到 smem
-        __syncthreads(); // 等所有线程用完上一个 tile, 才能覆盖 sK/sV
-        // Br=64 个线程合作搬 Bc*D = 32*64 = 2048 个 float, 每个线程搬 32 个
-        // 例: 第一次循环 idx = tid, tid 0~63 搬 K[kv_start+0][0~63]; warp 0 读 K 第 kv_start 行的 0~31 列, 128B 连续 = 4个sector
-        for (int idx = tid; idx < Bc * D; idx += Br) {
-            const int r = idx / D;
-            const int c = idx % D;
-            const int kv_row = kv_start + r;
-            sK[r][c] = kv_row < N ? K[kv_row * D + c] : 0.f;
-            sV[r][c] = kv_row < N ? V[kv_row * D + c] : 0.f;
-        }
-        __syncthreads(); // 等搬运完成
-
-        // 2. S 的一行 tile: s[c] = q·K[kv_start+c], 并求 tile 内最大值
-        // 读 sK[c][x]: 同一时刻 warp 内所有线程读同一地址 -> 广播, 没有 bank conflict
-        float s[Bc];
-        float tile_max = -INFINITY;
-#pragma unroll
-        for (int c = 0; c < Bc; ++c) {
-            float dot = 0.f;
-#pragma unroll
-            for (int x = 0; x < D; ++x) {
-                dot += q_reg[x] * sK[c][x];
-            }
-            const int j = kv_start + c;
-            // 越界列 (N 不是 Bc 的倍数) 和 causal 的上三角都设为 -inf, exp 后为 0
-            s[c] = (j >= N || (causal && j > row)) ? -INFINITY : dot;
-            tile_max = fmaxf(tile_max, s[c]);
+    // q_reg和K的每一行做点积 + online softmax
+    float m = -INFINITY; // 到目前为止的最大值
+    float l = 0.f;       // 以目前m为基准的指数和
+    // 遍历K的每一行
+    for(int k_row = 0; k_row < N; ++k_row)
+    {
+        // 遍历K的每一列做点积
+        float s = 0.f; // s相当于S[row][k_row], 每次循环计算S[row]的一个元素, 循环N次
+        for(int col = 0; col < D; ++col)
+        {
+            s += (q_reg[col] * K[k_row * D + col]);
         }
 
-        // 3. online softmax: 更新 m, l, 并求修正系数 alpha
-        // 第一个 tile 时 m = -inf, alpha = exp(-inf) = 0, 旧值被自然清掉
-        // 第一个 tile 一定包含 j = 0, 之后 m 都是有限值, 即使整个 tile 被 mask 也不会出现 -inf - (-inf) = NaN
-        const float m_new = fmaxf(m, tile_max);
-        const float alpha = expf(m - m_new);
-        float tile_sum = 0.f;
-#pragma unroll
-        for (int c = 0; c < Bc; ++c) {
-            s[c] = expf(s[c] - m_new); // 未归一化的 P
-            tile_sum += s[c];
-        }
-        l = alpha * l + tile_sum;
-
-        // 4. O = alpha * O + P·V_tile
-        // 读 sV[c][x]: 同样是 warp 内所有线程读同一地址 -> 广播
-#pragma unroll
-        for (int x = 0; x < D; ++x) {
-            float t = acc[x] * alpha;
-#pragma unroll
-            for (int c = 0; c < Bc; ++c) {
-                t += s[c] * sV[c][x];
-            }
-            acc[x] = t;
-        }
+        // online softmax + P * V
+        float m_new = fmaxf(m, s);
+        float alpha = expf(m - m_new);
+        float p = expf(s - m_new);
+        l = l  * alpha + p;
+        for (int x = 0; x < D; ++x)
+            acc[x] = alpha * acc[x] + p * V[k_row * D + x]; // 证明见笔记
         m = m_new;
     }
-
-    // 5. 最后统一归一化一次
-    if (valid) {
-        const float inv = 1.f / l;
-#pragma unroll
-        for (int x = 0; x < D; ++x) {
-            O[row * D + x] = acc[x] * inv;
-        }
+    for(int x = 0; x < D; ++x)
+    {
+        O[row * D + x] = acc[x] / l; // 除以l证明见笔记
     }
 }
 
@@ -133,7 +177,7 @@ void call_attention(const float *q, const float *k, const float *v, float *o)
 
     dim3 block(Br);
     dim3 grid(comm::ceil_div(N, Br), BH);
-    flash_attn_v1<Br, Bc, d><<<grid, block>>>(q, k, v, o, N, scale, causal);
+    flash_attn_v1<Br, Bc, d, N><<<grid, block>>>(q, k, v, o, scale, causal);
 }
 
 int main()

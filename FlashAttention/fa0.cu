@@ -11,6 +11,9 @@ namespace
     constexpr int H = 8;      // head 数
     constexpr int N = 1024;   // seqlen
     constexpr int d = 64;     // head dim
+    constexpr int BlockX = 16;
+    constexpr int BlockY = 16;
+
     constexpr bool causal = false; // 因果掩码
     constexpr int BH = B * H;
     constexpr size_t count = BH * N * d;       // Q/K/V/O 元素数
@@ -84,34 +87,34 @@ __global__ void pv_kernel(const float *P, const float *v, float *o,
     // grid(4, 64, 8) = 4*64*8 = 2048个线程块, 每个线程块16*16个线程, 每个线程块共16*16/32=8个warp
     // 一个warp = 2行(threadIdx.y) × 16列(threadIdx.x), 例: warp 0 中 lane 0~15 为 threadIdx=(0~15, 0), lane 16~31 为 threadIdx=(0~15, 1)
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i = blockIdx.y * blockDim.y + threadIdx.y;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int bh = blockIdx.z;
-    if (i >= N || x >= d) return;
+    if (y >= N || x >= d) return;
 
     const float *P_bh = P + bh * N * N;
     const float *V = v + bh * N * d;
     float *O = o + bh * N * d;
 
     float acc = 0.f;
-    for (int j = 0; j < N; ++j) {
+    for (int inner = 0; inner < N; ++inner) {
         acc += 
-        P_bh[i * N + j] *             
+        P_bh[y * N + inner] *             
         // 读P时, 第i个y方向上的线程读取P的第i行, 每个y方向上的线程间隔16个线程/半个warp. 因此一个warp读取P的两行, 对应2个sector
         // 例: block(0,0,0)的warp 0, j=5时: lane 0~15 (i=0) 都读P[0*1024+5]=P[5] (字节20, sector 0), lane 16~31 (i=1) 都读P[1*1024+5]=P[1029] (字节4116, sector 128) → 2个sector
 
-        V[j * d + x];          
+        V[inner * d + x];          
         // 读V时, 单次循环中j对整个warp相同, 第x个x方向上的线程读取V的第j行的第x个元素, 每个x方向上的线程连续排布, 单次循环一个线程读取4B, 半个warp读取16*4B=64B=2个sector, 另半个warp的threadIdx.x同样是0~15, 读取同样的64B, 因此一个warp读取2个sector
         // 例: j=5时: lane 0~15 (x=0~15) 读V[5*64+0~15]=V[320~335] (字节1280~1343, sector 40、41), lane 16~31 (x=0~15) 读同样的V[320~335] → 2个sector
     }
-    O[i * d + x] = acc;
+    O[y * d + x] = acc;
 }
 
 void call_attention(const float *q, const float *k, const float *v, float *o, float *S)
 {
     const float scale = 1.0f / sqrtf(static_cast<float>(d));
 
-    dim3 qk_block(16, 16);
-    dim3 qk_grid(comm::ceil_div(N, qk_block.x), comm::ceil_div(N, qk_block.y), BH);
+    dim3 qk_block(BlockX, BlockY);
+    dim3 qk_grid(comm::ceil_div(N, BlockX), comm::ceil_div(N, BlockY), BH);
     qk_kernel<<<qk_grid, qk_block>>>(q, k, S, N, d, scale, causal);
 
     const int rows = BH * N;
@@ -119,8 +122,8 @@ void call_attention(const float *q, const float *k, const float *v, float *o, fl
     dim3 sm_grid(comm::ceil_div(rows, sm_block.x));
     softmax_kernel<<<sm_grid, sm_block>>>(S, rows, N);
 
-    dim3 pv_block(16, 16);
-    dim3 pv_grid(comm::ceil_div(d, pv_block.x), comm::ceil_div(N, pv_block.y), BH);
+    dim3 pv_block(BlockX, BlockY);
+    dim3 pv_grid(comm::ceil_div(d, BlockX), comm::ceil_div(N, BlockY), BH);
     pv_kernel<<<pv_grid, pv_block>>>(S, v, o, N, d);
 }
 
