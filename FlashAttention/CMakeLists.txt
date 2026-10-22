@@ -13,6 +13,8 @@ find_package(CUDAToolkit REQUIRED)
 add_executable(attn_cpu attn_cpu.cc)
 add_executable(fa0 fa0.cu)
 add_executable(fa1 fa1.cu)
+add_executable(fa2 fa2.cu)
+add_executable(fa3 fa3.cu)
 
 message(STATUS "CMAKE_BUILD_TYPE = ${CMAKE_BUILD_TYPE}")
 
